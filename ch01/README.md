@@ -383,3 +383,69 @@ Poll 階段主要有兩個步驟如下：
      方法，那麼事件循環可能會進入等待狀態，並等待新的事件出現，這也是該階段為什麼會被命名為
      poll (輪詢)
      的原因。此外，還會不斷檢查是否有相關的定時器超時，如果有，就會跳轉到 timers 階段，然後執行對應的回調
+
+#### 4. check 階段
+
+setImmediate 是一個特殊的定時器方法，它佔據了事件循環的一個階段，整個 check 階段就是為 setImmediate 方法而設置的
+
+一般情況下，當事件循環到達 poll 階段後，就會檢查當前代碼是否調用了 setImmediate，但如果一個回調函數是被 setImmediate 方法調用的，事件循環就會跳出 poll 階段進而進入 check 階段
+
+#### 5. close 階段
+
+如果一個 socket 或者一個句柄被關閉，那麼就會產生一個 close 事件，該事件會被加入到對應的隊列中。close 階段執行完畢後，本輪事件循環結束，循環進入到下一輪
+
+看完上面敘述後，我們明白 Node 中的事件循環是分階段處理的，對於每一階段來說，處理事件隊列中的事件就是執行對應的回調方法，每一階段的事件循環都對應著不同的隊列
+
+在 Node 中，事件隊列不止一個，定時器相關的事件和磁盤 IO 產生的事件需要不同的處理方式，如果把所有的事件都放到同一隊列裡，勢必要增加許多類似 switch/case 的代碼；那樣的話倒不如將不同類型的事件歸類到不同的事件隊列裡，然後一層層地遍歷下來，如果當中出現了新的事件，就進行相應的處理
+
+為了更好理解 Node 中的事件循環，以一段代碼為例來配合說明：
+
+```javascript
+var fs = require('fs');
+
+var timeoutScheduled = Date.now();
+
+setTimeout(function() {
+  var delay = Date.now() - timeoutScheduled;
+  console.log(delay + 'ms have passed since I was scheduled');
+}, 1000);
+
+// 假設讀取文件需要 95 ms
+fs.readFile('/path/to/file', function(err, data) {
+  var startCallback = Date.now();
+  // 使用 while 循環阻塞 10 ms
+  while (Date.now() - startCallback < 10) {
+    ; // do nothing
+  }
+})
+```
+
+上面代碼講述事件循環不同過程的處理步驟。這段邏輯很簡單，包含了 readFile 和 timer 兩個異步操作
+
+我們來觀察這段代碼的執行過程，代碼開始運行後，事件循環也開始運作了
+
+首先檢查 timers，然而 timers 對應的事件隊列目前還為空 (100 ms 後才會有事件產生)，事件循環向後執行到了 poll 階段，到目前為止還沒有事件出現，由於代碼中沒有定義 setImmediate 操作，事件循環便在此一直等待新的事件出現
+
+直到 95 ms 後，readFile 讀取文件完畢，產生了一個事件，加入到了 poll 這一隊列中，此時事件循環將該隊列中的事件取出，準備執行之後的 callback (此時 err 和 data 的值已經就緒)，readFile 的回調方法什麼都沒做，只是暫停了 10 ms
+
+事件循環本身也被阻塞 10 ms，按照通常的思維，timers 隊列中的事件也已經就緒，應該先執行對應的回調方法才是，然而事件循環也是單線程運行的，因此也會停止 10 ms，如果 readFile 的回調函數中包含了一個死循環，那麼整個事件循環都會被被阻塞，setTimeout 的回調永遠不會執行
+
+readFile 的回調完成後，事件循環切換到 timers 階段，接著取出 timers 隊列中的事件執行對應的回調方法
+
+想知道更多關於事件循環的內容，也可參考 libuv 文檔中針對事件循環不同階段的處理方式：[http://docs.libuv.org/en/v1.x/design.html#the-i-o-loop](http://docs.libuv.org/en/v1.x/design.html#the-i-o-loop)
+
+講完事件循環，我們回過頭來看之前的那句話
+
+“除了你的代碼，一切都是並行的”
+
+試著回答幾個問題：
+
+- 如果存在並行，那麼應該位於 Node 的哪個層面？
+- 是事件循環提供了並行的能力嗎？
+- 如果你的計算機只有一個單核的 CPU (暫先不考慮超線程技術，即在一個 CPU 上同時執行兩個線程)，還能做到並行嗎？
+
+第三個答案：當你只有一個單核 CPU，就算把代碼寫出花來也不能獲得真正的並行
+
+第二個答案，事件循環運行在單線程環境中，這表示一個時刻只能處理一個事件，沒法提供並行支持
+
+第一個答案，如果真的存在並行，那麼只能存在於 libuv 的線程池中，實現的並行為線程級別的並行 (需要多核 CPU)
