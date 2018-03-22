@@ -449,3 +449,114 @@ readFile 的回調完成後，事件循環切換到 timers 階段，接著取出
 第二個答案，事件循環運行在單線程環境中，這表示一個時刻只能處理一個事件，沒法提供並行支持
 
 第一個答案，如果真的存在並行，那麼只能存在於 libuv 的線程池中，實現的並行為線程級別的並行 (需要多核 CPU)
+
+### process.nextTick
+
+process.nextTick 的意思就是定義出一個異步動作，並且讓這個動作在事件循環當前階段結束後執行
+
+例如下面代碼，將打印 first 的操作放在 nextTick 的回調中執行，最後先打印出
+next，再打印 first
+
+```javascript
+process.nextTick(function() {
+  console.log('first');
+});
+console.log('next');
+```
+
+process.nextTick
+其實並不是事件循環的一部分，但它的回調方法也是由事件循環調用的，該方法定義的回調方法會被加入到名為
+nextTickQueue 的隊列中。在事件循環的任何階段，如果 nextTickQueue
+不為空，都會在當前階段操作結束後優先執行 nextTickQueue 中的回調函數，當
+nextTickQueue 中的回調方法被執行完畢後，事件循環才會繼續向下執行
+
+Node 限制了 nextTickQueue 的大小，如果遞迴調用了 process.nextTick，那麼當
+nextTickQueue 達到最大限制後會拋出一個錯誤，可寫一個代碼來驗證這點：
+
+```javascript
+function recurse(i) {
+  while(i<9999) {
+    process.nextTick(recurse(i++));
+  }
+}
+recurse(0);
+```
+
+運行上面代碼，馬上就會出現：
+
+```
+RangeError: Maximum call stack size exceeded
+```
+
+的錯誤
+
+既然 nextTickQueue 也是一個隊列，那麼先被加入隊列的回調會先執行，我們可以定義多個 process.nextTick，然後觀察他們的執行順序：
+
+```javascript
+process.nextTick(function() {
+  console.log('first');
+});
+process.nextTick(function() {
+  console.log('second');
+});
+console.log('next');
+// next first second
+```
+
+和其他調用函數一樣，nextTick 定義的回調也是由事件循環執行的，如果 nextTick 的回調方法中出現了阻塞操作，後面的要執行的回調同樣會被阻塞
+
+```javascript
+process.nextTick(function() {
+  console.log('first');
+  // 由於死循環的存在，之後的事件被阻塞
+  while(true) {}
+});
+process.nextTick(function() {
+  console.log('second');
+});
+console.log('next');
+// 依次打印 next first，不會打印 second
+```
+
+#### 1. nextTick 與 setImmediate
+
+setImmediate 方法不屬於 ECMAScript 標準，而是 Node
+提出的新方法，它同樣將一個回調函數加入到事件隊列中，不同於 setTimeout 和
+setInterval，setImmediate 並不接受一個時間作為參數，setImmediate
+的事件會在當前事件循環的結尾觸發，對應的回調方法會在當前事件循環末尾 (check 階段) 執行
+
+setImmediate 方法和 process.nextTick
+方法很相似，兩者經常被拿來放在一起比較，由於 process.nextTick
+會在當前操作完成後立刻執行，因此總會在 setImmediate 之前執行
+
+關於這兩各方法有個笑話，nextTick 和 setImmediate 的行為和名稱含義是反過來的
+
+```javascript
+setImmediate(function(arg) {
+  console.log('executing immediate:', arg);
+}, 'so immediate');
+process.nextTick(function() {
+  console.log('next Tick');
+});
+
+// next Tick
+// executing immediate: so immediate
+```
+
+此外，當有遞迴的異步操作時只能使用 setImmediate，不能使用
+process.nextTick，前面已經展示過了遞迴調用 nextTick 會出現的錯誤，下面使用
+setImmediate 試試看：
+
+```javascript
+function recurse(i, end) {
+  if (i > end) {
+    console.log('Done!');
+  } else {
+    console.log(i);
+    setImmediate(recurse, i+1, end);
+  }
+}
+recurse(0, 99999999);
+```
+
+完全沒問題！這是因為 setImmediate 不會生成 call stack
